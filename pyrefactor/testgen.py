@@ -12,6 +12,23 @@ from pathlib import Path
 from typing import List, Optional
 
 from .extract import ExtractResult
+from .typeinfer import TypeGuess, split_generic
+
+_LITERALS = {
+    "int": "0", "float": "0.0", "complex": "0j", "str": '""', "bytes": 'b""', "bool": "False", "None": "None",
+    "list": "[]", "List": "[]", "Sequence": "[]", "Iterable": "[]", "deque": "[]",
+    "dict": "{}", "Dict": "{}", "Mapping": "{}", "OrderedDict": "{}", "defaultdict": "{}", "Counter": "{}",
+    "set": "set()", "Set": "set()", "frozenset": "frozenset()", "tuple": "()", "Tuple": "()",
+}
+
+
+def _placeholder_for(guess: TypeGuess, hints: List[str]) -> str:
+    """An empty value of the suggested type; falls back to how the block uses the argument."""
+    first = guess.type.split(" | ")[0]
+    lit = _LITERALS.get(split_generic(first)[0])
+    if lit is not None and guess.how != "unknown":
+        return lit
+    return _placeholder(hints)
 
 
 def _placeholder(hints: List[str]) -> str:
@@ -26,8 +43,13 @@ def _placeholder(hints: List[str]) -> str:
     return "None"
 
 
-def _comment(hints: List[str]) -> str:
-    return f"  # TODO: realistic value; used as: {', '.join(hints)}" if hints else "  # TODO: realistic value"
+def _comment(guess: TypeGuess, hints: List[str]) -> str:
+    text = f"  # TODO: realistic {guess.label}"
+    if guess.how.startswith("guessed"):
+        text += " (type guessed)"
+    elif guess.how == "unknown":
+        text = "  # TODO: realistic value (type unknown)"
+    return text + (f"; used as: {', '.join(hints)}" if hints else "")
 
 
 def default_test_path(target: Path, func_name: str, tests_dir: Optional[Path] = None) -> Path:
@@ -56,7 +78,8 @@ def render_test(result: ExtractResult, target: Path, test_path: Path) -> str:
     arg_lines = []
     for orig, final in zip(plan.params, result.params):
         hints = plan.param_hints.get(orig, [])
-        arg_lines.append(f"    {final} = {_placeholder(hints)}{_comment(hints)}")
+        guess = plan.param_types.get(orig) or TypeGuess("Any", "unknown")
+        arg_lines.append(f"    {final} = {_placeholder_for(guess, hints)}{_comment(guess, hints)}")
     args = ", ".join(result.params)
 
     if plan.kind in ("method", "classmethod"):
@@ -125,14 +148,16 @@ def render_test(result: ExtractResult, target: Path, test_path: Path) -> str:
             w(f"    {callee}({args})")
         w("")
         w("    # Assert")
+        rtype = {r: plan.return_types[r].label if r in plan.return_types else "Any" for r in plan.returns}
         if len(plan.returns) == 1:
-            w(f"    # The block computes `{plan.returns[0]}`, which the caller uses afterwards.")
-            w(f"    assert result == ...  # TODO: expected {plan.returns[0]}")
+            r = plan.returns[0]
+            w(f"    # The block computes `{r}` ({rtype[r]}), which the caller uses afterwards.")
+            w(f"    assert result == ...  # TODO: expected {r} ({rtype[r]})")
         elif plan.returns:
-            w(f"    # The block computes {', '.join('`%s`' % r for r in plan.returns)}, returned as a tuple.")
+            w(f"    # The block computes {', '.join('`%s`' % r for r in plan.returns)}, returned as {plan.returns_type}.")
             w(f"    {', '.join(plan.returns)} = result")
             for r in plan.returns:
-                w(f"    assert {r} == ...  # TODO: expected {r}")
+                w(f"    assert {r} == ...  # TODO: expected {r} ({rtype[r]})")
         else:
             w("    # The block returns nothing: it works through side effects. Assert on them, e.g.:")
             mutated = [
@@ -162,10 +187,10 @@ def render_test(result: ExtractResult, target: Path, test_path: Path) -> str:
         ideas = []
         for orig, final in zip(plan.params, result.params):
             hints = plan.param_hints.get(orig, [])
-            ph = _placeholder(hints)
+            ph = _placeholder_for(plan.param_types.get(orig) or TypeGuess("Any", "unknown"), hints)
             if ph in ("[]", "{}"):
                 ideas.append(f"empty `{final}`")
-            elif ph == "0":
+            elif ph in ("0", "0.0"):
                 ideas.append(f"zero/negative `{final}`")
             elif "truth-tested" in hints:
                 ideas.append(f"falsy `{final}`")

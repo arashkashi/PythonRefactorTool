@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from rich.console import Console
+from rich.markup import escape
 from rich.syntax import Syntax
 from rich.tree import Tree as RichTree
 
@@ -108,8 +109,14 @@ def _print_plan(console: Console, plan) -> None:
     console.print(f"[bold]Suggested name:[/bold] {plan.suggested_name}")
     for p in plan.params:
         hints = ", ".join(plan.param_hints.get(p, []))
-        console.print(f"  [cyan]arg[/cyan] {p}" + (f"   [dim]used as: {hints}[/dim]" if hints else ""))
-    console.print(f"[bold]Returns:[/bold] {', '.join(plan.returns) or '(nothing)'}")
+        g = plan.param_types[p]
+        console.print(f"  [cyan]arg[/cyan] {p}: {escape(g.label)}  [dim]({escape(g.how)})[/dim]"
+                      + (f"   [dim]used as: {hints}[/dim]" if hints else ""), highlight=False)
+    returns = ", ".join(f"{r}: {plan.return_types[r].label}" for r in plan.returns) or "(nothing)"
+    if len(plan.returns) > 1:
+        returns += f"  -> {plan.returns_type}"
+    console.print(f"[bold]Returns:[/bold] {escape(returns)}",
+                  highlight=False)
     for w in plan.warnings:
         console.print(f"[yellow]⚠ {w}[/yellow]")
     for p in plan.problems:

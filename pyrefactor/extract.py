@@ -29,6 +29,8 @@ from libcst.metadata import (
     ScopeProvider,
 )
 
+from .typeinfer import TypeGuess, TypeInferrer, describe, returns_type
+
 
 class RefactorError(Exception):
     """The requested refactoring cannot be performed safely."""
@@ -128,7 +130,13 @@ class ExtractPlan:
     param_hints: Dict[str, List[str]] = field(default_factory=dict)
     self_attrs_read: List[str] = field(default_factory=list)
     self_attrs_written: List[str] = field(default_factory=list)
+    param_types: Dict[str, TypeGuess] = field(default_factory=dict)
+    return_types: Dict[str, TypeGuess] = field(default_factory=dict)
     code: str = ""  # the selected statements, verbatim
+
+    @property
+    def returns_type(self) -> str:
+        return returns_type([self.return_types[r] for r in self.returns])
 
     @property
     def ok(self) -> bool:
@@ -611,6 +619,11 @@ def _analyze(an: _Analysis) -> Tuple[ExtractPlan, Dict]:
                 if attr not in bucket:
                     bucket.append(attr)
 
+    # ---- suggested types (Python has none; see typeinfer for where each one comes from)
+    inferrer = TypeInferrer(an.module, ctx.func, ctx.class_node, self_name)
+    param_types = {p: describe(inferrer, p, hints[p]) for p in params}
+    return_types = {r: describe(inferrer, r, []) for r in returns}
+
     lines = an.source.splitlines()
     header = lines[an.sel_start - 1].strip() if an.sel_start <= len(lines) else ""
     taken = _taken_names(an)
@@ -630,6 +643,8 @@ def _analyze(an: _Analysis) -> Tuple[ExtractPlan, Dict]:
         param_hints={k: v[:6] for k, v in hints.items()},
         self_attrs_read=self_read,
         self_attrs_written=self_written,
+        param_types=param_types,
+        return_types=return_types,
         code="\n".join(lines[an.sel_start - 1 : an.sel_end]),
     )
     extra = {"accesses": accesses, "assignments": assignments, "taken": taken}
@@ -690,6 +705,44 @@ class _Rewriter(cst.CSTTransformer):
         if self.container is original_node:
             return updated_node.with_changes(body=self._insert(original_node.body, updated_node.body))
         return updated_node
+
+
+def _type_note(guess: TypeGuess) -> str:
+    if guess.how == "annotated":
+        return "type from an annotation"
+    if guess.how == "inferred":
+        return "type inferred from assignments"
+    if guess.how.startswith("guessed"):
+        return "type GUESSED from usage (" + guess.how.split(": ", 1)[-1] + ")"
+    return "type unknown"
+
+
+def _docstring(plan: ExtractPlan, final_params: List[str], renames: Dict[str, str], indent: str) -> str:
+    """Google-style docstring stating the suggested type of every argument and result."""
+    out = [f'"""TODO: describe. Extracted from `{plan.qualname}` by pyrefactor.', ""]
+    if final_params:
+        out.append("Args:")
+        for orig, final in zip(plan.params, final_params):
+            g = plan.param_types.get(orig) or TypeGuess("Any", "unknown")
+            out.append(f"    {final} ({g.label}): TODO.  [{_type_note(g)}]")
+        out.append("")
+    out.append("Returns:")
+    if not plan.returns:
+        out.append("    None: works through side effects (mutated arguments, output, object state).")
+    elif len(plan.returns) == 1:
+        r = plan.returns[0]
+        g = plan.return_types[r]
+        out.append(f"    {g.label}: the new value of `{renames.get(r, r)}`.  [{_type_note(g)}]")
+    else:
+        out.append(f"    {plan.returns_type}: a tuple of")
+        for r in plan.returns:
+            g = plan.return_types[r]
+            out.append(f"        {renames.get(r, r)} ({g.label})  [{_type_note(g)}]")
+    out.append("")
+    out.append("Types are suggestions from pyrefactor's static analysis; Python does not enforce them.")
+    out.append("`?` marks a guess - check it before relying on it in tests.")
+    text = "\n".join((indent + line) if line and i else line for i, line in enumerate(out))
+    return text + "\n" + indent + '"""'
 
 
 def _names_expr(names: Sequence[str]) -> cst.BaseExpression:
@@ -757,9 +810,8 @@ def extract(
     body_stmts = [s.visit(renamer) for s in an.stmts]
     body_stmts[0] = body_stmts[0].with_changes(leading_lines=[])
 
-    doc = cst.SimpleStatementLine(
-        [cst.Expr(cst.SimpleString(f'"""TODO: describe. Extracted from `{plan.qualname}` by pyrefactor."""'))]
-    )
+    indent = " " * an.pos[an.ctx.func].start.column + an.module.default_indent
+    doc = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(_docstring(plan, final_params, renames, indent)))])
     new_body: List[cst.BaseStatement] = [doc] + body_stmts
     if plan.returns:
         new_body.append(cst.SimpleStatementLine([cst.Return(_names_expr([renames.get(r, r) for r in plan.returns]))]))

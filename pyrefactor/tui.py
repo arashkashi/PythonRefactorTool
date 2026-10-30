@@ -37,9 +37,12 @@ def _plan_summary(plan: ExtractPlan) -> Text:
     t.append("Would extract: ", style="bold")
     t.append(f"lines {plan.source_start}-{plan.source_end} ({plan.loc}) of {plan.qualname} as a {kind}\n")
     t.append("Arguments:  ", style="bold")
-    t.append((", ".join(plan.params) or "(none)") + "\n", style="cyan")
+    t.append((", ".join(f"{p}: {plan.param_types[p].label}" for p in plan.params) or "(none)") + "\n", style="cyan")
     t.append("Returns:    ", style="bold")
-    t.append((", ".join(plan.returns) or "(nothing)") + "\n", style="green")
+    t.append((", ".join(f"{r}: {plan.return_types[r].label}" for r in plan.returns) or "(nothing)"), style="green")
+    t.append(f"  -> {plan.returns_type}\n" if len(plan.returns) > 1 else "\n", style="green")
+    if any(g.how.startswith("guessed") or g.how == "unknown" for g in plan.param_types.values()):
+        t.append("types: ? = guessed from usage, Any = unknown\n", style="dim")
     for p in plan.problems:
         t.append(f"✗ {p}\n", style="bold red")
     for w in plan.warnings:
@@ -136,7 +139,7 @@ class ExtractScreen(ModalScreen[Optional[Tuple[ExtractResult, bool]]]):
                 Horizontal(
                     Label(p, classes="field-label"),
                     Input(value=p, id=f"param-{i}", classes="param"),
-                    Label(", ".join(hints), classes="hint"),
+                    Label(" · ".join([plan.param_types[p].label] + hints), classes="hint"),
                     classes="row",
                 )
             )

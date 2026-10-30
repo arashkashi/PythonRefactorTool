@@ -154,19 +154,24 @@ function sizes (green < p50 ≤ yellow < p75 ≤ orange < p90 ≤ **red**). Top-
   (or carried around an enclosing loop).
 * **Returns**: names the block binds that are read after it (or carried around an enclosing loop).
 * In a method: uses `self` → new method called as `self.x(...)`; doesn't → `@staticmethod`. Classmethods stay classmethods.
+* **Suggested types** for every argument and result, written into the new function's docstring
+  (`Args:` / `Returns:`, Google style) and shown in the dialog. Each says where it came from:
+  *annotated* (signature or annotated assignment), *inferred* (literals, constructors, calls to annotated
+  functions, `for x in List[T]`, `d.get(k, default)`, …) or *guessed* from usage (`.append()` → `list?`).
+  `Any` means unknown. No annotations are added to the code itself.
 * **Refused with an explanation** (never silently wrong): `return`, `yield`, `await`, `global`/`nonlocal`,
   `break`/`continue` aimed at a loop outside the selection, nested (closure) functions.
 * A selection that cuts through statements is snapped to whole statements; the dialog/CLI says so.
 
 Known limits: the inference is name-based, so it can't see aliasing tricks such as `locals()`/`exec`;
-extracted functions get a `TODO` docstring and no type annotations.
+extracted functions get a docstring with `TODO` descriptions and suggested types, but no type annotations.
 
 ## Unit-test drafts
 
 Written to `<file dir>/tests/test_<module>_<function>.py` (never overwrites; override with `--tests-dir`).
 They import the function, build the object via `__new__` for methods and pre-set only the `self.`
-attributes the block reads, fill placeholder arguments based on how each argument is *used*
-(`iterated` → `[]`, `["key"]` → `{}`, arithmetic → `0`), unpack the return values, and leave `assert ... == ...`
+attributes the block reads, fill placeholder arguments with an empty value of the suggested type (`int` → `0`, `str` → `""`,
+`list[...]` → `[]`), falling back to how each argument is *used*, with the type in each TODO comment, unpack the return values, and leave `assert ... == ...`
 TODOs plus an empty parametrized edge-case test. They are marked `skip` so they don't fail until completed.
 
 ## Tests
