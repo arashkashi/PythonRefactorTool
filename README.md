@@ -204,3 +204,7 @@ and the updates that feed it, with logging and unrelated side effects left out).
 
 Includes behaviour-equivalence tests (run code before/after extraction and compare) and a headless
 Textual test that clicks a block, edits the name/argument, previews and applies.
+
+## License
+
+[MIT](LICENSE) © 2026 Arash Kashi

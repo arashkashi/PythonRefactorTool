@@ -3,6 +3,7 @@ name = "pyrefactor"
 version = "0.1.0"
 description = "Interactive LibCST-based tree view and Extract-Function refactoring for Python files"
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.9"
 dependencies = [
     "libcst>=1.1",
