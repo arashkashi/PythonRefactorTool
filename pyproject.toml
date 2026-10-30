@@ -23,6 +23,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 packages = ["pyrefactor"]
 
+[tool.setuptools.package-data]
+pyrefactor = ["_recorder/*.py"]  # injected into the user's program to record real calls
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

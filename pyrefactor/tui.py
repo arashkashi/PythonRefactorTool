@@ -21,6 +21,7 @@ from .analyzer import SizeScale, TreeNode, build_tree, largest, size_scale
 from .extract import ExtractPlan, ExtractResult, RefactorError, analyze, extract, is_warm, warm_cache
 from .render import HEAT, apply_to_disk, file_label, legend, node_label, parse_range
 from .project import discover, line_count
+from .record import default_command, record_calls
 from .testgen import write_test
 
 PREVIEW_LINES = 60
@@ -84,12 +85,13 @@ class ExtractScreen(ModalScreen[Optional[Tuple[ExtractResult, bool]]]):
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
-    def __init__(self, source: str, filename: str, start: int, end: int, write_tests: bool):
+    def __init__(self, source: str, filename: str, start: int, end: int, write_tests: bool, run_command: str = ""):
         super().__init__()
         self.source = source
         self.filename = filename
         self.range = (start, end)
         self.write_tests = write_tests
+        self.run_command = run_command
         self.plan: Optional[ExtractPlan] = None
 
     def compose(self) -> ComposeResult:
@@ -104,7 +106,10 @@ class ExtractScreen(ModalScreen[Optional[Tuple[ExtractResult, bool]]]):
                 yield Input(id="fname")
             yield Label("Arguments (edit a name to rename it inside the new function):", id="params-title")
             yield VerticalScroll(id="params")
-            yield Checkbox("Write a unit-test draft", value=self.write_tests, id="wtest")
+            yield Checkbox("Write a unit test", value=self.write_tests, id="wtest")
+            with Horizontal(classes="row"):
+                yield Checkbox("…with real values from running", value=bool(self.run_command), id="record")
+                yield Input(value=self.run_command, placeholder="e.g. python3 main.py", id="runcmd")
             with Horizontal(classes="buttons"):
                 yield Button("Preview diff", id="preview", variant="primary")
                 yield Button("Cancel", id="cancel")
@@ -172,11 +177,15 @@ class ExtractScreen(ModalScreen[Optional[Tuple[ExtractResult, bool]]]):
             self.notify(str(exc), title="Cannot extract", severity="error", timeout=8)
             return
         want_test = self.query_one("#wtest", Checkbox).value
-        note = "[dim](+ unit-test draft)[/dim]" if want_test else ""
+        command = self.query_one("#runcmd", Input).value.strip() if self.query_one("#record", Checkbox).value else ""
+        if want_test and command:
+            note = f"[dim](+ unit test with values recorded from `{command}`)[/dim]"
+        else:
+            note = "[dim](+ unit-test draft)[/dim]" if want_test else ""
 
         def done(apply: Optional[bool]) -> None:
             if apply:
-                self.dismiss((result, want_test))
+                self.dismiss((result, want_test, command if want_test else ""))
 
         self.app.push_screen(DiffScreen(result, note), done)
 
@@ -237,6 +246,7 @@ class RefactorApp(App):
     .row { height: auto; }
     .field-label { width: 22; padding: 1 1 0 0; }
     .row Input { width: 1fr; }
+    #record { width: auto; }
     .hint { color: $text-muted; padding: 1 0 0 1; width: 1fr; }
     #params { height: auto; max-height: 12; border: round $panel; }
     #summary { padding: 0 0 1 0; max-height: 8; overflow-y: auto; }
@@ -269,6 +279,7 @@ class RefactorApp(App):
         # single file: <file dir>/tests ; project: <project>/tests
         self.tests_dir = tests_dir or (None if self.single_file else self.project_root / "tests")
         self.sort_by_size = True
+        self.run_commands: Dict[Path, str] = {}  # file -> last command used to record its test values
         self.files: Dict[Path, FileState] = {}
         self.file_nodes: Dict[Path, UITreeNode] = {}
         self.expanded: set = set()
@@ -589,19 +600,27 @@ class RefactorApp(App):
         if not isinstance(fs_or_start, FileState):  # open_extract(start, end) in single-file mode
             fs_or_start, start, end = self._single, fs_or_start, start
         fs = fs_or_start
-        screen = ExtractScreen(fs.source, fs.rel, start, end, self.write_tests)
+        command = self.run_commands.get(fs.path)
+        if command is None:
+            command = default_command(fs.path, self.project_root)
+        screen = ExtractScreen(fs.source, fs.rel, start, end, self.write_tests, command)
         self.push_screen(screen, lambda outcome: self._apply(fs, outcome))
 
-    def _apply(self, fs: FileState, outcome: Optional[Tuple[ExtractResult, bool]]) -> None:
+    def _apply(self, fs: FileState, outcome: Optional[Tuple[ExtractResult, bool, str]]) -> None:
         if not outcome:
             return
-        result, want_test = outcome
+        result, want_test, command = outcome
+        if command:
+            self.run_commands[fs.path] = command  # offer the same command next time
         if fs.path.read_text(encoding="utf-8") != fs.source:
             self.notify(f"{fs.rel} changed on disk since it was loaded; reload (r) and retry.", severity="error")
             return
         backup = apply_to_disk(fs.path, result.new_source)
         msg = f"Extracted {result.name}() in {fs.rel} · backup: {backup.name}"
-        if want_test:
+        if want_test and command:
+            msg += f"\nRecording real values: running `{command}`…"
+            self.run_worker(lambda: self._record_and_write_test(fs.path, result, command), thread=True, group="record")
+        elif want_test:
             test_path = write_test(result, fs.path, self.tests_dir)
             msg += f"\nTest draft: {test_path}"
         fs.new_names.add(result.name)
@@ -615,6 +634,21 @@ class RefactorApp(App):
         if ui is not None:
             ui.set_label(self._file_ui_label(fs))
         self.notify(msg, title="Refactored", timeout=10)
+
+    def _record_and_write_test(self, path: Path, result: ExtractResult, command: str) -> None:
+        try:
+            rec = record_calls(path, result, command, self.project_root)
+            test_path = write_test(result, path, self.tests_dir, rec)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the UI
+            self.call_from_thread(self.notify, f"Could not write the test: {exc}", severity="error", timeout=12)
+            return
+        if rec.ok:
+            msg = (f"{len(rec.cases)} recorded case(s) from {rec.calls} call(s) → {test_path}"
+                   f"\nRun it with: python3 -m pytest {test_path}")
+            self.call_from_thread(self.notify, msg, title="Unit test written", timeout=15)
+        else:
+            msg = f"{rec.problem}.\nWrote a draft with TODOs instead: {test_path}"
+            self.call_from_thread(self.notify, msg, title="No values recorded", severity="warning", timeout=15)
 
     def action_toggle_sort(self) -> None:
         self.sort_by_size = not self.sort_by_size

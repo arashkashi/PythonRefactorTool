@@ -7,9 +7,11 @@ marked ``skip`` so an unfinished draft never breaks the suite.
 """
 from __future__ import annotations
 
+import builtins
 import os
+import pickle
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .extract import ExtractResult
 from .typeinfer import TypeGuess, split_generic
@@ -213,10 +215,203 @@ def render_test(result: ExtractResult, target: Path, test_path: Path) -> str:
     return "\n".join(out)
 
 
-def write_test(result: ExtractResult, target: Path, tests_dir: Optional[Path] = None) -> Path:
+_SAME_HELPER = '''
+
+def _same(a, b):
+    """Equal data, also for objects without __eq__ (compared field by field)."""
+    return _shape(a) == _shape(b)
+
+
+def _shape(x, depth=0):
+    if depth > 50 or isinstance(x, (str, bytes, int, float, complex, bool, type(None))):
+        return x
+    d = depth + 1
+    if isinstance(x, dict):
+        return (type(x).__name__, sorted(((repr(k), _shape(v, d)) for k, v in x.items()), key=lambda t: t[0]))
+    if isinstance(x, (list, tuple)):
+        return (type(x).__name__, [_shape(v, d) for v in x])
+    if isinstance(x, (set, frozenset)):
+        return (type(x).__name__, sorted(repr(_shape(v, d)) for v in x))
+    fields = getattr(x, "__dict__", None)
+    if fields is None and hasattr(type(x), "__slots__"):
+        fields = {s: getattr(x, s) for s in type(x).__slots__ if hasattr(x, s)}
+    if fields is not None:
+        return (type(x).__qualname__, _shape(dict(fields), d))
+    return (type(x).__qualname__, repr(x))
+'''
+
+
+def render_recorded_test(result: ExtractResult, target: Path, test_path: Path, rec) -> Tuple[str, Dict]:
+    """A runnable test per recorded code path. Returns (source, data) where ``data`` holds the values
+    too complex to write inline, as pickled bytes keyed by case number."""
+    plan = result.plan
+    name = result.name
+    module = target.stem
+    cls_name = plan.class_qualname.split(".")[0] if plan.kind != "function" else ""
+    self_name = plan.self_name if plan.kind in ("method", "classmethod") else None
+    rel = os.path.relpath(target.parent.resolve(), test_path.parent.resolve())
+    path_expr = "Path(__file__).resolve().parent" if rel == "." else f"(Path(__file__).resolve().parent / {Path(rel).as_posix()!r})"
+
+    data: Dict[int, Dict[str, bytes]] = {}
+    imports_from_module = {cls_name or name}
+    uses = {"datetime": False, "same": False, "re": False}
+    collections_names: set = set()
+
+    def value_expr(i: int, key: str, v: dict) -> Tuple[str, str]:
+        """(python expression, trailing comment) for a recorded value."""
+        r = v.get("repr")
+        if r is not None:
+            imports_from_module.update(v.get("names", []))
+            if "datetime." in r:
+                uses["datetime"] = True
+            for c in ("OrderedDict", "Counter", "deque"):
+                if c + "(" in r:
+                    collections_names.add(c)
+            if "Decimal(" in r:
+                collections_names.add("Decimal")
+            return r, ""
+        data.setdefault(i, {})[key] = v["pickle"]
+        return f"_recorded({i}, {key!r})", f"  # {v['type']}: too complex to write inline"
+
+    body: List[str] = []
+    w = body.append
+    total = len(rec.cases)
+    for i, case in enumerate(rec.cases, 1):
+        args = case["args"]
+        needs_capsys = bool(case["stdout"])
+        w("")
+        w("")
+        w(f"def test_{name}_recorded_{i}({'capsys' if needs_capsys else ''}):")
+        w(f'    """Call #{case["call"]} of {rec.calls} while running `{rec.command}` '
+          f'(code path {i} of {total})."""')
+        call_args = []
+        if case.get("bundle"):
+            data.setdefault(i, {})["args"] = case["bundle"]
+            w(f"    recorded = _recorded({i}, 'args')  # loaded together: objects shared between arguments stay shared")
+
+        def arg_expr(arg: str) -> Tuple[str, str]:
+            if args[arg].get("repr") is None:
+                return f"recorded[{arg!r}]", f"  # {args[arg]['type']}"
+            return value_expr(i, arg, args[arg])
+
+        for arg in (p for p in args if p != self_name):  # recorded under the function's own parameter names
+            expr, note = arg_expr(arg)
+            w(f"    {arg} = {expr}{note}")
+            call_args.append(arg)
+        if plan.kind == "method":
+            expr, note = arg_expr(self_name)
+            w(f"    obj = {expr}{note}")
+            callee = f"obj.{name}"
+        elif plan.kind in ("staticmethod", "classmethod"):
+            callee = f"{cls_name}.{name}"
+        else:
+            callee = name
+        call = f"{callee}({', '.join(call_args)})"
+        w("")
+        if case["exc"] is not None:
+            exc_type, msg = case["exc"]
+            uses["re"] = True
+            builtin = isinstance(getattr(builtins, exc_type, None), type)
+            exc_expr = exc_type if builtin else f"{module}_{exc_type}"
+            if not builtin:
+                imports_from_module.add(f"{exc_type} as {module}_{exc_type}")
+            w(f"    with pytest.raises({exc_expr}, match=re.escape({msg!r})):")
+            w(f"        {call}")
+        elif plan.returns:
+            w(f"    result = {call}")
+            w("")
+            res = case["result"]
+            if res.get("repr") is not None and res.get("eq"):
+                expr, _ = value_expr(i, "result", res)
+                w(f"    assert result == {expr}")
+            else:
+                expr, note = value_expr(i, "result", {**res, "repr": None})
+                uses["same"] = True
+                w(f"    assert _same(result, {expr}){note}")
+        else:
+            w(f"    {call}")
+            w("")
+        for key, after in case["after"].items():
+            target_name = "obj" if key == self_name else key
+            what = "state of the object afterwards" if key == self_name else "changed in place"
+            if after.get("repr") is not None and after.get("eq"):
+                expr, _ = value_expr(i, "after:" + key, after)
+                w(f"    assert {target_name} == {expr}  # {what}")
+            else:
+                expr, _ = value_expr(i, "after:" + key, {**after, "repr": None})
+                uses["same"] = True
+                w(f"    assert _same({target_name}, {expr})  # {what}")
+        if needs_capsys:
+            out = case["stdout"]
+            if len(out) <= 300:
+                w(f"    assert capsys.readouterr().out == {out!r}")
+            else:
+                data.setdefault(i, {})["stdout"] = pickle.dumps(out)
+                w(f"    assert capsys.readouterr().out == _recorded({i}, 'stdout')  # {len(out)} characters")
+        if not case["after"] and not plan.returns and not needs_capsys and case["exc"] is None:
+            w("    # The recorded call changed none of its arguments and printed nothing.")
+
+    head: List[str] = []
+    h = head.append
+    h(f'"""Characterization tests for `{plan.class_qualname + "." if cls_name else ""}{name}`.')
+    h("")
+    h(f"Generated by pyrefactor when `{name}` was extracted from `{plan.qualname}`")
+    h(f"({target.name}, originally lines {plan.source_start}-{plan.source_end}).")
+    h("")
+    h(f"The values below were recorded from a real run of `{rec.command}`: the function ran")
+    h(f"{rec.calls} time(s); each test pins one distinct code path (inputs, result, in-place changes and")
+    h("printed output). They run on their own, without the program. If you change the function's")
+    h("behaviour on purpose, update the expected values.")
+    h('"""')
+    if uses["datetime"]:
+        h("import datetime")
+    if data:
+        h("import pickle")
+    if uses["re"]:
+        h("import re")
+    h("import sys")
+    if collections_names - {"Decimal"}:
+        h(f"from collections import {', '.join(sorted(collections_names - {'Decimal'}))}")
+    if "Decimal" in collections_names:
+        h("from decimal import Decimal")
+    h("from pathlib import Path")
+    h("")
+    h("import pytest  # noqa: F401")
+    h("")
+    h(f"sys.path.insert(0, str({path_expr}))  # make `{module}` importable")
+    h("")
+    h(f"from {module} import {', '.join(sorted(imports_from_module))}  # noqa: E402")
+    if data:
+        h("")
+        h(f"_DATA = Path(__file__).resolve().parent / \"data\" / {test_path.stem + '.pkl'!r}")
+        h("_RECORDED = pickle.loads(_DATA.read_bytes())  # case number -> name -> pickled value")
+        h("")
+        h("")
+        h("def _recorded(case, key):")
+        h('    """A fresh copy of a recorded value (tests may change it freely)."""')
+        h("    return pickle.loads(_RECORDED[case][key])")
+    text = "\n".join(head)
+    if uses["same"]:
+        text += "\n" + _SAME_HELPER.rstrip("\n")
+    text += "\n" + "\n".join(body) + "\n"
+    return text, data
+
+
+def write_test(result: ExtractResult, target: Path, tests_dir: Optional[Path] = None, recording=None) -> Path:
+    """Write a runnable characterization test when ``recording`` holds real calls, else a draft."""
     path = default_test_path(target, result.name, tests_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = render_test(result, target, path)
-    compile(text, str(path), "exec")  # the draft must at least be valid Python
+    if recording is not None and recording.ok:
+        text, data = render_recorded_test(result, target, path, recording)
+        compile(text, str(path), "exec")
+        if data:
+            data_path = path.parent / "data" / (path.stem + ".pkl")
+            data_path.parent.mkdir(parents=True, exist_ok=True)
+            data_path.write_bytes(pickle.dumps(data, protocol=4))
+    else:
+        text = render_test(result, target, path)
+        if recording is not None and recording.problem:
+            text = text.replace('"""\nimport sys', f'\nNo values could be recorded: {recording.problem}.\n"""\nimport sys', 1)
+        compile(text, str(path), "exec")  # the draft must at least be valid Python
     path.write_text(text, encoding="utf-8")
     return path

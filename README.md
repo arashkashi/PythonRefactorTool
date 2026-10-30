@@ -111,6 +111,7 @@ pyrefactor tree sample/legacy_shop.py --sort      # biggest first
 pyrefactor analyze sample/legacy_shop.py --lines 120-180     # inferred args/returns, no changes
 pyrefactor extract sample/legacy_shop.py --lines 120-180     # asks name + each arg, shows diff, asks to apply
 pyrefactor extract FILE --lines 120-180 --name f --rename items=line_items -y   # scripted
+pyrefactor extract FILE --lines 120-180 --name f -y --run "python3 FILE"         # + test with recorded values
 ```
 
 ### Interactive tree
@@ -166,13 +167,32 @@ function sizes (green < p50 ≤ yellow < p75 ≤ orange < p90 ≤ **red**). Top-
 Known limits: the inference is name-based, so it can't see aliasing tricks such as `locals()`/`exec`;
 extracted functions get a docstring with `TODO` descriptions and suggested types, but no type annotations.
 
-## Unit-test drafts
+## Unit tests
 
-Written to `<file dir>/tests/test_<module>_<function>.py` (never overwrites; override with `--tests-dir`).
-They import the function, build the object via `__new__` for methods and pre-set only the `self.`
-attributes the block reads, fill placeholder arguments with an empty value of the suggested type (`int` → `0`, `str` → `""`,
-`list[...]` → `[]`), falling back to how each argument is *used*, with the type in each TODO comment, unpack the return values, and leave `assert ... == ...`
-TODOs plus an empty parametrized edge-case test. They are marked `skip` so they don't fail until completed.
+**With recorded values (runnable, no TODOs).** Tick *…with real values from running* in the dialog
+(pre-filled with `python3 <file>` when the file has an `if __name__ == "__main__":` block; edit it to your
+real entry point, e.g. `python3 main.py`), or pass `--run "CMD"` to `pyrefactor extract`. After applying,
+pyrefactor runs that command **once**, records real calls of the new function and writes
+`tests/test_<module>_<function>.py`:
+
+* one test per **distinct code path** (up to 3; chosen by which lines of the function ran);
+* the real arguments: simple values written inline (`rows = [(1, 2.5), (2, 1.0)]`), complex ones
+  (objects, big lists, `random.Random`) loaded from `tests/data/<test>.pkl` (all arguments of a call are
+  stored together so objects shared between them stay shared);
+* asserts on the result, on every argument changed **in place**, on `self` for methods, on printed output
+  (`capsys`), and `pytest.raises` for calls that raised.
+
+The tests run on their own, without the program, and fail when the function's behaviour changes. The
+program's side effects (files it writes, etc.) happen during that one run. If recording is impossible
+(the function is never called, values cannot be pickled, the command fails) you get a draft instead.
+
+**Draft (no recording).** The signature, the suggested types and how each argument is used are known,
+the expected values are not: placeholders are empty values of the suggested type, with `TODO` asserts and
+`@pytest.mark.skip` so an unfinished draft never breaks the suite.
+
+The new function's docstring is generated from facts: the section comment above the block (heading and
+explanation), what the block changes in place, prints and returns, and per argument its role
+(read only / updated in place / starting value that is returned), its use and its suggested type.
 
 ## Tests
 

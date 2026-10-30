@@ -20,6 +20,7 @@ from rich.tree import Tree as RichTree
 from .analyzer import TreeNode, build_tree, largest, size_scale
 from .extract import RefactorError, analyze, extract
 from .render import apply_to_disk, legend, node_label, parse_range
+from .record import default_command, record_calls
 from .testgen import write_test
 
 SUBCOMMANDS = {"tui", "tree", "analyze", "extract"}
@@ -75,6 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="only print the diff")
     p.add_argument("--no-tests", action="store_true", help="do not write a unit-test draft")
     p.add_argument("--tests-dir", type=Path, help="where to write test drafts (default: <file dir>/tests)")
+    p.add_argument("--run", metavar="CMD",
+                   help="after extracting, run CMD (e.g. \"python3 shop.py\") once and write a unit test from the "
+                        "real calls it makes to the new function")
     return parser
 
 
@@ -156,8 +160,24 @@ def _cmd_extract(args, console: Console) -> int:
         return 1
     backup = apply_to_disk(args.file, result.new_source)
     console.print(f"[green]✓ wrote {args.file}[/green]  (backup: {backup})")
-    if not args.no_tests:
-        console.print(f"[green]✓ test draft:[/green] {write_test(result, args.file, args.tests_dir)}")
+    if args.no_tests:
+        return 0
+    rec = None
+    if args.run:
+        console.print(f"Recording real values: running [bold]{escape(args.run)}[/bold] …")
+        rec = record_calls(args.file, result, args.run, Path.cwd())
+        for err in rec.errors:
+            console.print(f"[yellow]⚠ {escape(err)}[/yellow]")
+    path = write_test(result, args.file, args.tests_dir, rec)
+    if rec is not None and rec.ok:
+        console.print(f"[green]✓ unit test[/green] ({len(rec.cases)} recorded case(s) from {rec.calls} call(s)): {path}")
+    else:
+        if rec is not None:
+            console.print(f"[yellow]⚠ {escape(rec.problem)}[/yellow]")
+        console.print(f"[green]✓ test draft:[/green] {path}")
+        hint = default_command(args.file, Path.cwd())
+        if rec is None and hint:
+            console.print(f"[dim]  tip: add --run \"{hint}\" to fill the test with real values[/dim]")
     return 0
 
 
