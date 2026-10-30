@@ -16,6 +16,7 @@ from __future__ import annotations
 import difflib
 import keyword
 import re
+import textwrap
 import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -132,6 +133,10 @@ class ExtractPlan:
     self_attrs_written: List[str] = field(default_factory=list)
     param_types: Dict[str, TypeGuess] = field(default_factory=dict)
     return_types: Dict[str, TypeGuess] = field(default_factory=dict)
+    param_mutations: Dict[str, List[str]] = field(default_factory=dict)  # how the block changes an argument in place
+    section: str = ""  # the section comment right above the block, if any
+    section_notes: str = ""  # further comment lines below that heading
+    prints: bool = False
     code: str = ""  # the selected statements, verbatim
 
     @property
@@ -390,6 +395,67 @@ def _suggest_name(stmts: Sequence[cst.BaseStatement], header: str, taken: Set[st
     return name
 
 
+MUTATING_METHODS = {
+    "append", "extend", "insert", "remove", "pop", "clear", "sort", "reverse", "add", "discard", "update",
+    "setdefault", "popitem", "appendleft", "extendleft", "popleft", "rotate", "difference_update",
+    "intersection_update", "symmetric_difference_update", "write", "writerow", "writerows",
+}
+
+
+def _mutation(an: _Analysis, node: cst.Name) -> Optional[str]:
+    """How this use of a name changes the object in place (``x.append()``, ``x[k] = v``), if it does."""
+    parent = an.parents.get(node)
+    grand = an.parents.get(parent) if parent is not None else None
+    if isinstance(parent, cst.Attribute) and parent.value is node:
+        if isinstance(grand, cst.Call) and grand.func is parent and parent.attr.value in MUTATING_METHODS:
+            return f".{parent.attr.value}()"
+        if isinstance(grand, cst.AssignTarget) or (isinstance(grand, cst.AugAssign) and grand.target is parent):
+            return f".{parent.attr.value} = ..."
+    if isinstance(parent, cst.Subscript) and parent.value is node:
+        if isinstance(grand, cst.AssignTarget) or (isinstance(grand, cst.AugAssign) and grand.target is parent):
+            return "[...] = ..."
+        if isinstance(grand, cst.Del):
+            return "del [...]"
+        # x[k].append(...) / x[k][j] = ... change what x holds
+        outer = grand
+        while isinstance(outer, (cst.Subscript, cst.Attribute)):
+            nxt = an.parents.get(outer)
+            if isinstance(outer, cst.Attribute) and isinstance(nxt, cst.Call) and nxt.func is outer \
+                    and outer.attr.value in MUTATING_METHODS:
+                return f"[...].{outer.attr.value}()"
+            if isinstance(nxt, cst.AssignTarget) or (isinstance(nxt, cst.AugAssign) and nxt.target is outer):
+                return "[...][...] = ..."
+            outer = nxt
+    return None
+
+
+def _comment_block(stmts: Sequence[cst.BaseStatement]) -> List[str]:
+    """The comment lines directly above the block (top to bottom), without ``#`` and ``---`` rulers."""
+    group: List[str] = []
+    for line in reversed(list(stmts[0].leading_lines)):
+        if line.comment is None:
+            break
+        group.append(line.comment.value.lstrip("#").strip().strip("-=*#~ ").strip())
+    return [g for g in reversed(group) if g]
+
+
+def _section_comment(stmts: Sequence[cst.BaseStatement]) -> str:
+    block = _comment_block(stmts)
+    return block[0] if block else ""
+
+
+def _calls_print(stmt: cst.CSTNode) -> bool:
+    found = []
+
+    class V(cst.CSTVisitor):
+        def visit_Call(self, node: cst.Call) -> None:
+            if isinstance(node.func, cst.Name) and node.func.value == "print":
+                found.append(node)
+
+    stmt.visit(V())
+    return bool(found)
+
+
 def _usage_hint(an: _Analysis, node: cst.Name) -> Optional[str]:
     parent = an.parents.get(node)
     grand = an.parents.get(parent) if parent is not None else None
@@ -598,6 +664,7 @@ def _analyze(an: _Analysis) -> Tuple[ExtractPlan, Dict]:
 
     # ---- hints for the unit-test draft
     hints: Dict[str, List[str]] = {p: [] for p in params}
+    mutations: Dict[str, List[str]] = {}
     self_read: List[str] = []
     self_written: List[str] = []
     for name, node in sorted(accesses.values(), key=lambda t: an.key(t[1])):
@@ -607,6 +674,9 @@ def _analyze(an: _Analysis) -> Tuple[ExtractPlan, Dict]:
             h = _usage_hint(an, node)
             if h and h not in hints[name]:
                 hints[name].append(h)
+            m = _mutation(an, node)
+            if m and m not in mutations.setdefault(name, []):
+                mutations[name].append(m)
         if uses_self and name == self_name:
             parent = an.parents.get(node)
             if isinstance(parent, cst.Attribute) and parent.value is node:
@@ -645,6 +715,10 @@ def _analyze(an: _Analysis) -> Tuple[ExtractPlan, Dict]:
         self_attrs_written=self_written,
         param_types=param_types,
         return_types=return_types,
+        param_mutations=mutations,
+        section=_section_comment(an.stmts),
+        section_notes=" ".join(_comment_block(an.stmts)[1:]),
+        prints=any(_calls_print(s) for s in an.stmts),
         code="\n".join(lines[an.sel_start - 1 : an.sel_end]),
     )
     extra = {"accesses": accesses, "assignments": assignments, "taken": taken}
@@ -717,18 +791,63 @@ def _type_note(guess: TypeGuess) -> str:
     return "type unknown"
 
 
+def _param_role(plan: ExtractPlan, orig: str, final: str) -> str:
+    """What the block does with an argument, as far as static analysis can tell."""
+    changes = plan.param_mutations.get(orig, [])
+    hints = [h for h in plan.param_hints.get(orig, []) if h not in changes]
+    if orig in plan.returns:
+        role = "starting value; the updated value is returned"
+    elif changes:
+        role = "updated in place (" + ", ".join(f"`{final}{c}`" for c in changes[:3]) + ")"
+    else:
+        role = "read only"
+    if hints:
+        role += "; used as: " + ", ".join(hints[:4])
+    return role[0].upper() + role[1:] + "."
+
+
+def _summary(plan: ExtractPlan, final_params: List[str], renames: Dict[str, str]) -> List[str]:
+    head = f"{plan.section[0].upper() + plan.section[1:]}: one step" if plan.section else "One step"
+    lines = [f"{head} of `{plan.qualname}` (originally lines {plan.source_start}-{plan.source_end})."]
+    if plan.section_notes:
+        lines.append(plan.section_notes)
+    effects = []
+    changed = [f"`{final}`" for orig, final in zip(plan.params, final_params)
+               if plan.param_mutations.get(orig) and orig not in plan.returns]
+    if changed:
+        effects.append("updates " + ", ".join(changed) + " in place")
+    if plan.self_attrs_written:
+        effects.append("sets " + ", ".join(f"`self.{a}`" for a in plan.self_attrs_written))
+    if plan.prints:
+        effects.append("prints to stdout")
+    if plan.returns:
+        effects.append("returns " + ", ".join(f"`{renames.get(r, r)}`" for r in plan.returns))
+    if effects:
+        text = "; ".join(effects)
+        lines.append(text[0].upper() + text[1:] + ".")
+    return lines
+
+
+def _doc_safe(text: str) -> str:
+    """Comment text and hints end up inside a triple-quoted string."""
+    return text.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
+
+
 def _docstring(plan: ExtractPlan, final_params: List[str], renames: Dict[str, str], indent: str) -> str:
-    """Google-style docstring stating the suggested type of every argument and result."""
-    out = [f'"""TODO: describe. Extracted from `{plan.qualname}` by pyrefactor.', ""]
+    """Google-style docstring: what the block does, and each argument's role and suggested type."""
+    summary = _summary(plan, final_params, renames)
+    width = max(60, 96 - len(indent))
+    body = [w for line in summary[1:] for w in textwrap.wrap(line, width)]
+    out = [f'"""{summary[0]}', ""] + body + ([""] if body else [])
     if final_params:
         out.append("Args:")
         for orig, final in zip(plan.params, final_params):
             g = plan.param_types.get(orig) or TypeGuess("Any", "unknown")
-            out.append(f"    {final} ({g.label}): TODO.  [{_type_note(g)}]")
+            out.append(f"    {final} ({g.label}): {_param_role(plan, orig, final)}  [{_type_note(g)}]")
         out.append("")
     out.append("Returns:")
     if not plan.returns:
-        out.append("    None: works through side effects (mutated arguments, output, object state).")
+        out.append("    None: works only through the side effects above.")
     elif len(plan.returns) == 1:
         r = plan.returns[0]
         g = plan.return_types[r]
@@ -741,6 +860,7 @@ def _docstring(plan: ExtractPlan, final_params: List[str], renames: Dict[str, st
     out.append("")
     out.append("Types are suggestions from pyrefactor's static analysis; Python does not enforce them.")
     out.append("`?` marks a guess - check it before relying on it in tests.")
+    out = [out[0][:3] + _doc_safe(out[0][3:])] + [_doc_safe(line) for line in out[1:]]
     text = "\n".join((indent + line) if line and i else line for i, line in enumerate(out))
     return text + "\n" + indent + '"""'
 

@@ -57,7 +57,8 @@ def test_usage_guess_is_marked():
 
 def test_docstring_lists_types():
     new = extract(SRC, 19, 23, "step").new_source
-    assert "rates (Dict[str, float]): TODO.  [type from an annotation]" in new
-    assert "order (Order): TODO.  [type inferred from assignments]" in new
+    assert "rates (Dict[str, float]): Read only; used as: .get().  [type from an annotation]" in new
+    assert "names (list): Updated in place (`names.append()`)" in new
+    assert "TODO" not in new
     assert "float: the new value of `total`." in new
     compile(new, "x.py", "exec")
