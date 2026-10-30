@@ -60,5 +60,6 @@ def test_docstring_lists_types():
     assert "rates (Dict[str, float]): Read only; used as: .get().  [type from an annotation]" in new
     assert "names (list): Updated in place (`names.append()`)" in new
     assert "TODO" not in new
-    assert "float: the new value of `total`." in new
+    assert "float: the new value of `total`, computed by:" in new
+    assert '            rate = rates.get("eu", 1.0)\n            total += money(rate * 2)\n' in new
     compile(new, "x.py", "exec")

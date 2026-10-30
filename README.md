@@ -191,8 +191,10 @@ the expected values are not: placeholders are empty values of the suggested type
 `@pytest.mark.skip` so an unfinished draft never breaks the suite.
 
 The new function's docstring is generated from facts: the section comment above the block (heading and
-explanation), what the block changes in place, prints and returns, and per argument its role
-(read only / updated in place / starting value that is returned), its use and its suggested type.
+explanation), what the block changes in place, calls, prints and returns, and per argument its role
+(read only / updated in place / starting value that is returned), its use and its suggested type. Under `Returns:` each value comes with **how it is computed**: the
+statements of the block that determine it (a backward slice: the loops, the `if ...: continue` guards
+and the updates that feed it, with logging and unrelated side effects left out).
 
 ## Tests
 

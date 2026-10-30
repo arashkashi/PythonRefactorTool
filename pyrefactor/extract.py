@@ -30,6 +30,7 @@ from libcst.metadata import (
     ScopeProvider,
 )
 
+from .slicing import backward_slice
 from .typeinfer import TypeGuess, TypeInferrer, describe, returns_type
 
 
@@ -136,6 +137,8 @@ class ExtractPlan:
     param_mutations: Dict[str, List[str]] = field(default_factory=dict)  # how the block changes an argument in place
     section: str = ""  # the section comment right above the block, if any
     section_notes: str = ""  # further comment lines below that heading
+    derivations: Dict[str, str] = field(default_factory=dict)  # returned name -> the code that computes it
+    calls: List[str] = field(default_factory=list)  # methods called on arguments/self that may have side effects
     prints: bool = False
     code: str = ""  # the selected statements, verbatim
 
@@ -429,6 +432,82 @@ def _mutation(an: _Analysis, node: cst.Name) -> Optional[str]:
     return None
 
 
+PURE_METHODS = {
+    "get", "items", "keys", "values", "copy", "count", "index", "find", "startswith", "endswith", "format",
+    "join", "split", "strip", "lower", "upper", "replace", "isoformat", "strftime", "toordinal", "most_common",
+    "isdigit", "isalpha", "weekday", "date", "total_seconds", "snapshot",
+}
+
+
+def _effect_calls(stmts: Sequence[cst.BaseStatement], roots: Set[str], limit: int = 6) -> List[str]:
+    """``ctx.inventory.receive()``-style calls on arguments that may change them (not known read-only methods)."""
+    found: List[str] = []
+
+    class V(cst.CSTVisitor):
+        def visit_Call(self, node: cst.Call) -> None:
+            f = node.func
+            if not isinstance(f, cst.Attribute) or f.attr.value in PURE_METHODS or f.attr.value in MUTATING_METHODS:
+                return
+            base = f.value
+            while isinstance(base, cst.Attribute):
+                base = base.value
+            if isinstance(base, cst.Name) and base.value in roots:
+                text = cst.Module([]).code_for_node(f) + "()"
+                if text not in found and len(text) <= 60:
+                    found.append(text)
+
+    for s in stmts:
+        s.visit(V())
+    return found[:limit]
+
+
+def _derivations(an: _Analysis, returns: List[str], budget: int = 40) -> Dict[str, str]:
+    """For each returned name, the statements of the block that compute it (a backward slice)."""
+    out: Dict[str, str] = {}
+    for name in returns:
+        code = backward_slice(an.stmts, an.parents, [name])
+        if code is None or code.count("\n") + 1 > budget:
+            continue
+        budget -= code.count("\n") + 1
+        out[name] = code
+    return out
+
+
+class _RenameVariables(cst.CSTTransformer):
+    """Rename variables in a code snippet (not attribute names or keyword arguments)."""
+
+    def __init__(self, renames: Dict[str, str]):
+        self.renames = renames
+        self.skip: Set[int] = set()
+
+    def visit_Attribute(self, node: cst.Attribute) -> None:
+        self.skip.add(id(node.attr))
+
+    def visit_Arg(self, node: cst.Arg) -> None:
+        if node.keyword is not None:
+            self.skip.add(id(node.keyword))
+
+    def leave_Name(self, original_node: cst.Name, updated_node: cst.Name) -> cst.Name:
+        new = self.renames.get(original_node.value)
+        return updated_node.with_changes(value=new) if new and id(original_node) not in self.skip else updated_node
+
+
+def _renamed(code: str, renames: Dict[str, str]) -> str:
+    if not renames:
+        return code
+    try:
+        return cst.parse_module(code).visit(_RenameVariables(renames)).code
+    except cst.ParserSyntaxError:  # pragma: no cover - slices are valid code taken from the block
+        return code
+
+
+def _derivation_lines(plan: ExtractPlan, name: str, renames: Dict[str, str], indent: str) -> List[str]:
+    code = plan.derivations.get(name)
+    if not code:
+        return []
+    return [""] + [indent + line if line.strip() else "" for line in _renamed(code, renames).rstrip("\n").splitlines()]
+
+
 def _comment_block(stmts: Sequence[cst.BaseStatement]) -> List[str]:
     """The comment lines directly above the block (top to bottom), without ``#`` and ``---`` rulers."""
     group: List[str] = []
@@ -718,6 +797,8 @@ def _analyze(an: _Analysis) -> Tuple[ExtractPlan, Dict]:
         param_mutations=mutations,
         section=_section_comment(an.stmts),
         section_notes=" ".join(_comment_block(an.stmts)[1:]),
+        derivations=_derivations(an, returns),
+        calls=_effect_calls(an.stmts, set(params) | ({self_name} if self_name else set())),
         prints=any(_calls_print(s) for s in an.stmts),
         code="\n".join(lines[an.sel_start - 1 : an.sel_end]),
     )
@@ -794,11 +875,16 @@ def _type_note(guess: TypeGuess) -> str:
 def _param_role(plan: ExtractPlan, orig: str, final: str) -> str:
     """What the block does with an argument, as far as static analysis can tell."""
     changes = plan.param_mutations.get(orig, [])
-    hints = [h for h in plan.param_hints.get(orig, []) if h not in changes]
+    own_calls = [c for c in plan.calls if c.startswith(orig + ".")]
+    hints = [h for h in plan.param_hints.get(orig, [])
+             if h not in changes and not any(c.endswith(h) or c.startswith(orig + h) for c in own_calls)]
     if orig in plan.returns:
         role = "starting value; the updated value is returned"
     elif changes:
         role = "updated in place (" + ", ".join(f"`{final}{c}`" for c in changes[:3]) + ")"
+    elif any(c.startswith(orig + ".") for c in plan.calls):
+        calls = [f"`{final}{c[len(orig):]}`" for c in plan.calls if c.startswith(orig + ".")]
+        role = "may be changed by " + ", ".join(calls[:3])
     else:
         role = "read only"
     if hints:
@@ -818,6 +904,8 @@ def _summary(plan: ExtractPlan, final_params: List[str], renames: Dict[str, str]
         effects.append("updates " + ", ".join(changed) + " in place")
     if plan.self_attrs_written:
         effects.append("sets " + ", ".join(f"`self.{a}`" for a in plan.self_attrs_written))
+    if plan.calls:
+        effects.append("calls " + ", ".join(f"`{c}`" for c in plan.calls))
     if plan.prints:
         effects.append("prints to stdout")
     if plan.returns:
@@ -851,12 +939,19 @@ def _docstring(plan: ExtractPlan, final_params: List[str], renames: Dict[str, st
     elif len(plan.returns) == 1:
         r = plan.returns[0]
         g = plan.return_types[r]
-        out.append(f"    {g.label}: the new value of `{renames.get(r, r)}`.  [{_type_note(g)}]")
+        how = ", computed by:" if plan.derivations.get(r) else "."
+        out.append(f"    {g.label}: the new value of `{renames.get(r, r)}`{how}  [{_type_note(g)}]")
+        out.extend(_derivation_lines(plan, r, renames, "        "))
     else:
         out.append(f"    {plan.returns_type}: a tuple of")
         for r in plan.returns:
             g = plan.return_types[r]
-            out.append(f"        {renames.get(r, r)} ({g.label})  [{_type_note(g)}]")
+            how = ", computed by:" if plan.derivations.get(r) else ""
+            out.append(f"        {renames.get(r, r)} ({g.label}){how}  [{_type_note(g)}]")
+            lines = _derivation_lines(plan, r, renames, "            ")
+            out.extend(lines[1:] + [""] if lines else [])
+        if out[-1] == "":
+            out.pop()
     out.append("")
     out.append("Types are suggestions from pyrefactor's static analysis; Python does not enforce them.")
     out.append("`?` marks a guess - check it before relying on it in tests.")
