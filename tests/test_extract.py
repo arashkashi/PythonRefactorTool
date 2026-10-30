@@ -172,3 +172,35 @@ def test_rebound_loop_variables_are_not_args_or_returns():
     exec(REUSE, ns_old)
     exec(extract(REUSE, 5, 9, "sum_orders").new_source, ns_new)
     assert ns_old["pipeline"]([[1, 2], [3]], "b") == ns_new["pipeline"]([[1, 2], [3]], "b")
+
+
+BRANCHES = textwrap.dedent(
+    '''\
+    def build(n):
+        out = []
+        for i in range(n):
+            if i % 2:
+                name = "odd"
+                email = "o@x"
+            else:
+                name = "even"
+                email = "e@x"
+            if i == 1:
+                email = "broken"
+            out.append((name, email))
+        return out
+    '''
+)
+
+
+def test_if_else_binding_in_all_branches_is_not_passed_in():
+    # `email` is rebound later in the loop, so it looks loop-carried; but the if/else always binds it,
+    # so passing it in would read it before the first iteration ever assigned it (UnboundLocalError)
+    plan = analyze(BRANCHES, 4, 9)
+    assert plan.params == ["i"]
+    assert plan.returns == ["name", "email"]
+    assert not plan.warnings
+    ns_old, ns_new = {}, {}
+    exec(BRANCHES, ns_old)
+    exec(extract(BRANCHES, 4, 9, "pick").new_source, ns_new)
+    assert ns_old["build"](4) == ns_new["build"](4)

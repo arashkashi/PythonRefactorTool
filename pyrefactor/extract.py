@@ -561,21 +561,9 @@ def _analyze(an: _Analysis) -> Tuple[ExtractPlan, Dict]:
         elif an.line(node) < an.sel_start or an.in_loop_region(node):
             writes_before.add(name)
 
-    # names bound unconditionally by a plain top-level assignment of the selection
-    unconditional: Set[str] = set()
-    for s in an.stmts:
-        if isinstance(s, cst.SimpleStatementLine):
-            for small in s.body:
-                targets = []
-                if isinstance(small, cst.Assign):
-                    targets = [t.target for t in small.targets]
-                elif isinstance(small, cst.AnnAssign) and small.value is not None:
-                    targets = [small.target]
-                for t in targets:
-                    if isinstance(t, cst.Name):
-                        unconditional.add(t.value)
-                    elif isinstance(t, (cst.Tuple, cst.List)):
-                        unconditional.update(e.value.value for e in t.elements if isinstance(e.value, cst.Name))
+    # names the selection binds on every path (plain assignment, or if/elif/else assigning in all branches);
+    # such a name must not also be passed in: before the first loop iteration it may not exist yet
+    unconditional: Set[str] = {n for n in writes_in if any(_always_binds(s, n) for s in an.stmts)}
 
     returns = sorted((n for n in writes_in if n in reads_after and n != self_name), key=lambda n: writes_in[n])
     params_set = {n for n in reads_in if n in writes_before}
