@@ -205,6 +205,7 @@ class FileState:
     ranks: Dict[int, int] = field(default_factory=dict)  # id(TreeNode) -> rank among functions/methods
     error: str = ""
     loading: bool = False
+    new_names: set = field(default_factory=set)  # functions extracted in this session, tagged in the tree
 
 
 @dataclass
@@ -269,6 +270,7 @@ class RefactorApp(App):
         self.file_nodes: Dict[Path, UITreeNode] = {}
         self.expanded: set = set()
         self._plans: Dict[Tuple[Path, int, int], object] = {}
+        self._focus: Optional[Tuple[Path, str]] = None  # (file, function) to select once the file reloads
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -357,7 +359,27 @@ class RefactorApp(App):
             self._fill_file(ui, fs)
             if fs.path in self.expanded:
                 ui.expand()
+            if self._focus is not None and self._focus[0] == fs.path:
+                self._select_function(ui, self._focus[1])
+                self._focus = None
         self._refresh_details()
+
+    def _select_function(self, file_ui: UITreeNode, name: str) -> None:
+        """Put the cursor on the freshly extracted function, wherever the sort placed it."""
+        stack = list(file_ui.children)
+        while stack:
+            ui = stack.pop()
+            item = ui.data
+            if item is not None and item.kind == "code" and item.node.kind in ("function", "method") \
+                    and item.node.name == name:
+                parent = ui.parent
+                while parent is not None:
+                    parent.expand()
+                    parent = parent.parent
+                tree = self.query_one("#tree", Tree)
+                self.call_after_refresh(tree.move_cursor, ui)
+                return
+            stack.extend(ui.children)
 
     # ---- tree building
     def _file_ui_label(self, fs: FileState) -> Text:
@@ -374,6 +396,8 @@ class RefactorApp(App):
     def _add_code(self, ui: UITreeNode, node: TreeNode, fs: FileState) -> None:
         for child in self._sorted(node.children):
             label = node_label(child, fs.scale, rank=fs.ranks.get(id(child)))
+            if child.kind in ("function", "method") and child.name in fs.new_names:
+                label.append("  ✚ new", style="bold green")
             item = Item("code", path=fs.path, file=fs, node=child)
             if child.children:
                 sub = ui.add(label, data=item, expand=child.kind in ("class", "code"))
@@ -577,6 +601,8 @@ class RefactorApp(App):
         if want_test:
             test_path = write_test(result, fs.path, self.tests_dir)
             msg += f"\nTest draft: {test_path}"
+        fs.new_names.add(result.name)
+        self._focus = (fs.path, result.name)  # the reload moves the cursor onto the new function
         # re-analyse just this file, in place
         self._plans = {k: v for k, v in self._plans.items() if k[0] != fs.path}
         fs.root = None

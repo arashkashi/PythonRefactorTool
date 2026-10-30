@@ -144,6 +144,12 @@ async def test_project_folder_sorted_ranked_and_refactored_in_place(tmp_path):
         await pilot.click("#apply")
         await pilot.pause()
         await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.pause()
+        # the new function is tagged and selected, even though biggest-first sorting puts it lower down
+        cur = tree.cursor_node
+        assert cur.data.node.name == "add_order_lines", cur.label
+        assert "✚ new" in str(cur.label)
 
     new = (tmp_path / "pkg" / "shop.py").read_text()
     assert "def add_order_lines(" in new

@@ -133,7 +133,8 @@ file) and test drafts go to `<project>/tests/`.
 
 In the dialog you confirm the **function name** and **each argument name** (renaming an argument renames
 it inside the new function only; the call site keeps the caller's variable). *Preview diff* → *Apply*.
-On apply it writes `FILE.bak` (then `.bak2`, …) and, if ticked, a unit-test draft.
+On apply it writes `FILE.bak` (then `.bak2`, …) and, if ticked, a unit-test draft; the tree reloads with the
+cursor on the new function, tagged `✚ new` (it is usually small, so biggest-first sorting puts it low in the list).
 
 ### Levels of abstraction
 
